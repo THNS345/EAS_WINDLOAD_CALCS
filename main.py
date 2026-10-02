@@ -14,8 +14,10 @@ NOT for design or permit use. The project engineer's / specification's design pr
 Run:  streamlit run wind_pressure_app.py
 """
 
+import hmac
 import math
 import re
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -33,10 +35,10 @@ MIN_PSF = 16.0  # minimum C&C pressure (ultimate), either direction
 # Exposure: (alpha, zg [ft])
 EXPOSURE = {"B": (7.0, 1200.0), "C": (9.5, 900.0), "D": (11.5, 700.0)}
 
-# GCp for walls, h <= 60 ft (ASCE 7-10 / 7-16 Part 1), at 10 sf and at 500 sf
+# GCp for walls, h <= 60 ft (Figure 30.3-1), at 10 sf and at 500 sf; log-linear in between
 GCP = {
     4: {"pos": (1.0, 0.7), "neg": (-1.1, -0.8)},
-    5: {"pos": (1.0, 0.7), "neg": (-1.4, -1.0)},
+    5: {"pos": (1.0, 0.7), "neg": (-1.4, -0.8)},
 }
 
 
@@ -340,8 +342,78 @@ def show_logo():
     st.markdown("**European Architectural Supply**")
 
 
+# ----------------------------------------------------------------------------
+# Login (credentials live in Streamlit secrets, never in this file)
+#
+#   .streamlit/secrets.toml  (local)  or  App settings > Secrets  (Streamlit Cloud)
+#       [credentials.users]
+#       username = "password"
+# ----------------------------------------------------------------------------
+MAX_ATTEMPTS = 5
+LOCKOUT_SECONDS = 60
+
+
+def _load_users() -> dict:
+    try:
+        users = st.secrets["credentials"]["users"]
+        return {str(k).strip().lower(): str(v) for k, v in users.items()}
+    except Exception:
+        return {}
+
+
+def check_login(username: str, password: str, users: dict) -> bool:
+    """Constant-time comparison. Usernames are not case sensitive, passwords are."""
+    key = username.strip().lower()
+    stored = users.get(key)
+    if stored is None:
+        hmac.compare_digest(password.encode(), b"x" * 16)  # keep timing similar
+        return False
+    return hmac.compare_digest(password.encode(), stored.encode())
+
+
+def require_login() -> None:
+    """Show the login form and stop the script until the user is signed in."""
+    if st.session_state.get("auth_user"):
+        return
+    users = _load_users()
+    show_logo()
+    st.title("Wind Load for Window Walls")
+    if not users:
+        st.error("Login is not configured. Add [credentials.users] to the Streamlit secrets.")
+        st.stop()
+
+    locked_until = st.session_state.get("locked_until", 0.0)
+    wait = int(locked_until - time.time())
+    if wait > 0:
+        st.error(f"Too many failed attempts. Try again in {wait} seconds.")
+        st.stop()
+
+    with st.form("login"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+    if submitted:
+        if check_login(username, password, users):
+            st.session_state["auth_user"] = username.strip().lower()
+            st.session_state["failed"] = 0
+            st.rerun()
+        fails = st.session_state.get("failed", 0) + 1
+        st.session_state["failed"] = fails
+        if fails >= MAX_ATTEMPTS:
+            st.session_state["locked_until"] = time.time() + LOCKOUT_SECONDS
+            st.session_state["failed"] = 0
+        st.error("Wrong username or password.")
+    st.stop()
+
+
 def main():
     st.set_page_config(page_title="EAS Wind Load", layout="centered")
+    require_login()
+    with st.sidebar:
+        st.write(f"Signed in as **{st.session_state['auth_user']}**")
+        if st.button("Sign out"):
+            st.session_state.clear()
+            st.rerun()
     show_logo()
     st.title("Wind Load for Window Walls")
     st.caption("Enter the wind speed, building height and window wall layout. "
@@ -462,7 +534,7 @@ def main():
         st.markdown(
             f"""
 - qh = 0.00256 · Kz · Kzt · Kd · Ke · V², p = qh · (GCp − GCpi), minimum 16 psf ultimate.
-- Wall coefficients (ASCE 7-10 / 7-16, h ≤ 60 ft): Zone 4 +1.0/−1.1 at 10 sf to +0.7/−0.8 at 500 sf. Zone 5 +1.0/−1.4 to +0.7/−1.0.
+- Wall coefficients (h ≤ 60 ft): Zone 4 +1.0/−1.1 at 10 sf to +0.7/−0.8 at 500 sf. Zone 5 +1.0/−1.4 to +0.7/−0.8. The 10% wall reduction allowed for roof slopes of 10° or less is not applied (conservative).
 - Mullions: effective area = span × larger of (tributary width, span ÷ 3). The value shown is the highest of all mullions and jambs.
 - Value given to the factory is entered as {convention_text()}. This is a setting at the top of the app file (FACTORY_CONVENTION, GAMMA).
 - Not covered: buildings above 60 ft, roofs and skylights, wind-borne debris and impact glazing, wind tunnel pressures, tornado loads, local amendments.
